@@ -49,7 +49,8 @@
 
 #include "pingpong.h"
 
-#define MAX_MP_CONN (8)
+#define MAX_MP_CONN         (8)
+#define MIN_ROUTS_THRESHOLD (8)
 
 enum {
 	PINGPONG_RECV_WRID = 0,
@@ -452,7 +453,7 @@ static int pp_post_recv(struct pingpong_context *ctx, int n, int qp_idx)
 	return i;
 }
 
-static int pp_post_send(struct pingpong_context *ctx, int qp_idx)
+static int pp_post_send(struct pingpong_context *ctx, int n, int qp_idx)
 {
 	struct ibv_sge list = {
 		.addr	= (uintptr_t) ctx->buf,
@@ -467,8 +468,13 @@ static int pp_post_send(struct pingpong_context *ctx, int qp_idx)
 		.send_flags = IBV_SEND_SIGNALED,
 	};
 	struct ibv_send_wr *bad_wr;
+	int i;
 
-	return ibv_post_send(ctx->qp[qp_idx], &wr, &bad_wr);
+	for (i = 0; i < n; ++i)
+		if (ibv_post_send(ctx->qp[qp_idx], &wr, &bad_wr))
+			break;
+
+	return i;
 }
 
 static void usage(const char *argv0)
@@ -509,6 +515,7 @@ int main(int argc, char *argv[])
 	int                      iters = 1000;
 	int                      use_event = 0;
 	int                      routs[MAX_MP_CONN];
+	int                      souts[MAX_MP_CONN];
 	int                      rcnt, scnt;
 	int                      num_cq_events = 0;
 	int                      sl = 0;
@@ -518,6 +525,7 @@ int main(int argc, char *argv[])
 	int                      qp_idx;
 	int                      wr_id_qp;
 	int                      wr_id_type;
+	int                      use_bandwidth;
 
 	srand48(getpid() * time(NULL));
 
@@ -536,10 +544,11 @@ int main(int argc, char *argv[])
 			{ .name = "events",   .has_arg = 0, .val = 'e' },
 			{ .name = "gid-idx",  .has_arg = 1, .val = 'g' },
 			{ .name = "conns",    .has_arg = 1, .val = 'c' },
+			{ .name = "bandwidth",.has_arg = 0, .val = 'b' },
 			{ 0 }
 		};
 
-		c = getopt_long(argc, argv, "p:d:i:s:m:r:n:l:eg:c:", long_options, NULL);
+		c = getopt_long(argc, argv, "p:d:i:s:m:r:n:l:eg:c:b", long_options, NULL);
 		if (c == -1)
 			break;
 
@@ -598,6 +607,10 @@ int main(int argc, char *argv[])
 
 		case 'c':
 			conns = strtol(optarg, NULL, 0);
+			break;
+
+		case 'b':
+			++use_bandwidth;
 			break;
 
 		default:
@@ -704,13 +717,15 @@ int main(int argc, char *argv[])
 				return 1;
 
 	for (qp_idx = 0; qp_idx < conns; qp_idx++) {
-		ctx->pending[qp_idx] = 1 << PINGPONG_RECV_WRID;
+		ctx->pending[qp_idx] = use_bandwidth ? 0 : (1 << PINGPONG_RECV_WRID);
 	}
 
 	if (servername) {
+		scnt = use_bandwidth ? ctx->rx_depth : 1;
 		for (qp_idx = 0; qp_idx < conns; qp_idx++) {
-			if (pp_post_send(ctx, qp_idx)) {
-				fprintf(stderr, "Couldn't post send\n");
+			souts[qp_idx] = pp_post_send(ctx, scnt, qp_idx);
+			if (souts[qp_idx] < scnt) {
+				fprintf(stderr, "Couldn't post send (%d)\n", souts[qp_idx]);
 				return 1;
 			}
 			ctx->pending[qp_idx] |= 1 << PINGPONG_SEND_WRID;
@@ -771,11 +786,21 @@ int main(int argc, char *argv[])
 				wr_id_qp   = (int) wc[i].wr_id / PINGPONG_MAX_WRID;
 				switch (wr_id_type) {
 				case PINGPONG_SEND_WRID:
+					if (use_bandwidth && --souts[wr_id_qp] <= MIN_ROUTS_THRESHOLD) {
+						souts[wr_id_qp] += pp_post_send(ctx, ctx->rx_depth - souts[wr_id_qp], wr_id_qp);
+						if (souts[wr_id_qp] < ctx->rx_depth) {
+							fprintf(stderr,
+									"Couldn't post send (%d)\n",
+									routs[wr_id_qp]);
+							return 1;
+						}
+					}
+
 					++scnt;
 					break;
 
 				case PINGPONG_RECV_WRID:
-					if (--routs[wr_id_qp] <= 1) {
+					if (--routs[wr_id_qp] <= MIN_ROUTS_THRESHOLD) {
 						routs[wr_id_qp] += pp_post_recv(ctx, ctx->rx_depth - routs[wr_id_qp], wr_id_qp);
 						if (routs[wr_id_qp] < ctx->rx_depth) {
 							fprintf(stderr,
@@ -796,12 +821,14 @@ int main(int argc, char *argv[])
 
 				ctx->pending[wr_id_qp] &= ~(1<<wr_id_type);
 				if (scnt < iters && !ctx->pending) {
-					if (pp_post_send(ctx, wr_id_qp)) {
+					if (pp_post_send(ctx, 1, wr_id_qp)) {
 						fprintf(stderr, "Couldn't post send\n");
 						return 1;
 					}
-					ctx->pending[wr_id_qp] = (1 << PINGPONG_RECV_WRID) |
-						       (1 << PINGPONG_SEND_WRID);
+					ctx->pending[wr_id_qp] = use_bandwidth ?
+							(1 << PINGPONG_SEND_WRID) :
+							((1 << PINGPONG_RECV_WRID) |
+							 (1 << PINGPONG_SEND_WRID));
 				}
 			}
 		}
