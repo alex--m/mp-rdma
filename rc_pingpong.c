@@ -41,11 +41,13 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <netdb.h>
 #include <stdlib.h>
 #include <getopt.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <fcntl.h>
 
 #include "pingpong.h"
 
@@ -60,6 +62,14 @@ enum {
 
 static int page_size;
 
+
+struct pingpong_ecn {
+	int _rp_cnp_handled;
+	int _rp_cnp_ignored;
+	int _np_cnp_sent;
+	int _np_ecn_marked_roce_packets;
+};
+
 struct pingpong_context {
 	struct ibv_context	*context;
 	struct ibv_comp_channel *channel;
@@ -67,12 +77,87 @@ struct pingpong_context {
 	struct ibv_mr		*mr;
 	struct ibv_cq		*cq;
 	struct ibv_qp		*qp[MAX_MP_CONN];
+	struct pingpong_ecn	ecn_fds;
 	void			*buf;
 	int			 size;
 	int			 rx_depth;
 	int			 pending[MAX_MP_CONN];
 	struct ibv_port_attr     portinfo;
 };
+
+#define ECN_COUNTER_PATH ("/sys/class/infiniband/%s/ports/%i/hw_counters/%s")
+#define MAX_ECN_PATH_LEN (100)
+#define MAX_ECN_VALUE_LEN (10)
+#define ECN_COUNTER(ecn, counter)                                   \
+	(*((int*)((char*)(ecn) +                                        \
+		offsetof(struct pingpong_ecn, _ ## counter))))
+
+#define ECN_OPEN_ONE(ecn_fds, dev_name, port_num, counter)          \
+{                                                                   \
+	char path[MAX_ECN_PATH_LEN];                                    \
+	snprintf(path, MAX_ECN_PATH_LEN, ECN_COUNTER_PATH,              \
+		dev_name, port_num, # counter );                            \
+	int fd = open(path, O_RDONLY);                                  \
+	if (fd < 0) {                                                   \
+		fprintf(stderr, "Couldn't open the ECN counter files\n");   \
+		return 1;                                                   \
+	}                                                               \
+	ECN_COUNTER(ecn_fds, counter) = fd;                             \
+}
+
+#define ECN_OPEN(ecn_fds, dev_name, port_num)                       \
+{                                                                   \
+	ECN_OPEN_ONE(ecn_fds, dev_name, port_num, rp_cnp_handled);      \
+	ECN_OPEN_ONE(ecn_fds, dev_name, port_num, rp_cnp_ignored);      \
+	ECN_OPEN_ONE(ecn_fds, dev_name, port_num, np_cnp_sent);         \
+	ECN_OPEN_ONE(ecn_fds, dev_name, port_num,                       \
+		np_ecn_marked_roce_packets);                                \
+}
+
+#define ECN_CLOSE_ONE(ecn_fds, counter)                             \
+	close(ECN_COUNTER(ecn_fds, counter))
+
+#define ECN_CLOSE(ecn_fds)                                          \
+{                                                                   \
+	ECN_CLOSE_ONE(ecn_fds, rp_cnp_handled);                         \
+	ECN_CLOSE_ONE(ecn_fds, rp_cnp_ignored);                         \
+	ECN_CLOSE_ONE(ecn_fds, np_cnp_sent);                            \
+	ECN_CLOSE_ONE(ecn_fds, np_ecn_marked_roce_packets);             \
+}
+
+#define ECN_READ_ONE(ecn_fds, out, counter)                         \
+{                                                                   \
+	char read_buf[MAX_ECN_VALUE_LEN];                               \
+	lseek(ECN_COUNTER(ecn_fds, counter), 0, SEEK_SET);              \
+	int ret = read(ECN_COUNTER(ecn_fds, counter),                   \
+		&read_buf, MAX_ECN_VALUE_LEN);                              \
+	if (ret < 0) {                                                  \
+		return ret;                                                 \
+	}                                                               \
+	read_buf[ret] = 0;                                              \
+	ECN_COUNTER(out, counter) = atoi(read_buf);                     \
+}
+
+#define ECN_READ(ecn_fds, out)                                      \
+{                                                                   \
+	ECN_READ_ONE(ecn_fds, out, rp_cnp_handled);                     \
+	ECN_READ_ONE(ecn_fds, out, rp_cnp_ignored);                     \
+	ECN_READ_ONE(ecn_fds, out, np_cnp_sent);                        \
+	ECN_READ_ONE(ecn_fds, out, np_ecn_marked_roce_packets);         \
+}
+
+#define ECN_PRINT_ONE(out, counter)                                 \
+	printf(#counter "=%i\n", (ECN_COUNTER(out, counter)))
+
+#define ECN_PRINT(ecn_fds)                                          \
+{                                                                   \
+	struct pingpong_ecn temp;          	                            \
+	ECN_READ(ecn_fds, &temp);                                       \
+	ECN_PRINT_ONE(&temp, rp_cnp_handled);                           \
+	ECN_PRINT_ONE(&temp, rp_cnp_ignored);                           \
+	ECN_PRINT_ONE(&temp, np_cnp_sent);                              \
+	ECN_PRINT_ONE(&temp, np_ecn_marked_roce_packets);               \
+}
 
 struct pingpong_dest {
 	int lid;
@@ -495,6 +580,8 @@ static void usage(const char *argv0)
 	printf("  -e, --events           sleep on CQ events (default poll)\n");
 	printf("  -g, --gid-idx=<gid index> local port gid index\n");
 	printf("  -c, --conns=<conns>    number of concurrent connections (default 1)\n");
+	printf("  -b, --bandwidth        measure the bandwidth instead of the latency\n");
+	printf("  -q, --query-ecn        query ECN counter for each connection\n");
 }
 
 int main(int argc, char *argv[])
@@ -526,6 +613,7 @@ int main(int argc, char *argv[])
 	int                      wr_id_qp;
 	int                      wr_id_type;
 	int                      use_bandwidth;
+	int                      query_ecn;
 
 	srand48(getpid() * time(NULL));
 
@@ -545,6 +633,7 @@ int main(int argc, char *argv[])
 			{ .name = "gid-idx",  .has_arg = 1, .val = 'g' },
 			{ .name = "conns",    .has_arg = 1, .val = 'c' },
 			{ .name = "bandwidth",.has_arg = 0, .val = 'b' },
+			{ .name = "query-ecn",.has_arg = 0, .val = 'q' },
 			{ 0 }
 		};
 
@@ -613,6 +702,10 @@ int main(int argc, char *argv[])
 			++use_bandwidth;
 			break;
 
+		case 'q':
+			++query_ecn;
+			break;
+
 		default:
 			usage(argv[0]);
 			return 1;
@@ -655,6 +748,10 @@ int main(int argc, char *argv[])
 	ctx = pp_init_ctx(ib_dev, size, conns, rx_depth, ib_port, use_event, !servername);
 	if (!ctx)
 		return 1;
+
+	if (query_ecn) {
+		ECN_OPEN(&ctx->ecn_fds, ib_dev->dev_name, port);
+	}
 
 	for (qp_idx = 0; qp_idx < conns; qp_idx++) {
 		routs[qp_idx] = pp_post_recv(ctx, ctx->rx_depth, qp_idx);
@@ -712,9 +809,10 @@ int main(int argc, char *argv[])
 	       rem_dest->lid, rem_dest->qpn[0], rem_dest->psn, gid);
 
 	if (servername)
-		for (qp_idx = 0; qp_idx < conns; qp_idx++)
+		for (qp_idx = 0; qp_idx < conns; qp_idx++) {
 			if (pp_connect_ctx(ctx, ib_port, my_dest.psn, mtu, sl, rem_dest, gidx, qp_idx))
 				return 1;
+		}
 
 	for (qp_idx = 0; qp_idx < conns; qp_idx++) {
 		ctx->pending[qp_idx] = use_bandwidth ? 0 : (1 << PINGPONG_RECV_WRID);
@@ -730,6 +828,11 @@ int main(int argc, char *argv[])
 			}
 			ctx->pending[qp_idx] |= 1 << PINGPONG_SEND_WRID;
 		}
+	}
+
+	if (query_ecn) {
+		printf("ECN counter - before starting:\n");
+		ECN_PRINT(&ctx->ecn_fds);
 	}
 
 	if (gettimeofday(&start, NULL)) {
@@ -848,10 +951,18 @@ int main(int argc, char *argv[])
 		       bytes, usec / 1000000., bytes * 8. / usec);
 		printf("%d iters in %.2f seconds = %.2f usec/iter\n",
 		       iters, usec / 1000000., usec / iters);
+
+		if (query_ecn) {
+			printf("ECN counter - after finishing:\n");
+			ECN_PRINT(&ctx->ecn_fds);
+		}
 	}
 
 	ibv_ack_cq_events(ctx->cq, num_cq_events);
 
+	if (query_ecn) {
+		ECN_CLOSE(&ctx->ecn_fds);
+	}
 	if (pp_close_ctx(ctx))
 		return 1;
 
