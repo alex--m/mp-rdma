@@ -51,8 +51,11 @@
 
 #include "pingpong.h"
 
-#define MAX_MP_CONN         (8)
-#define MIN_ROUTS_THRESHOLD (8)
+#define MP_REBALANCE_SEND_FRACTION (1000)
+#define MP_REBALANCE_INTERVAL      (1e6)
+#define MAX_MP_CONN                (8)
+#define MIN_ROUTS_THRESHOLD        (8)
+#define MAX_RATIO                  (100)
 
 enum {
 	PINGPONG_RECV_WRID = 0,
@@ -82,81 +85,104 @@ struct pingpong_context {
 	int			 size;
 	int			 rx_depth;
 	int			 pending[MAX_MP_CONN];
+	unsigned	 ratio[MAX_MP_CONN];
 	struct ibv_port_attr     portinfo;
+	int                      random_seed;
 };
 
 #define ECN_COUNTER_PATH ("/sys/class/infiniband/%s/ports/%i/hw_counters/%s")
 #define MAX_ECN_PATH_LEN (100)
 #define MAX_ECN_VALUE_LEN (10)
-#define ECN_COUNTER(ecn, counter)                                   \
-	(*((int*)((char*)(ecn) +                                        \
+#define ECN_COUNTER(ecn, counter)                                      \
+	(*((int*)((char*)(ecn) +                                           \
 		offsetof(struct pingpong_ecn, _ ## counter))))
 
-#define ECN_OPEN_ONE(ecn_fds, dev_name, port_num, counter)          \
-{                                                                   \
-	char path[MAX_ECN_PATH_LEN];                                    \
-	snprintf(path, MAX_ECN_PATH_LEN, ECN_COUNTER_PATH,              \
-		dev_name, port_num, # counter );                            \
-	int fd = open(path, O_RDONLY);                                  \
-	if (fd < 0) {                                                   \
-		fprintf(stderr, "Couldn't open the ECN counter files\n");   \
-		return 1;                                                   \
-	}                                                               \
-	ECN_COUNTER(ecn_fds, counter) = fd;                             \
+#define ECN_OPEN_ONE(ecn_fds, dev_name, port_num, counter)             \
+{                                                                      \
+	char path[MAX_ECN_PATH_LEN];                                       \
+	snprintf(path, MAX_ECN_PATH_LEN, ECN_COUNTER_PATH,                 \
+		dev_name, port_num, # counter );                               \
+	int fd = open(path, O_RDONLY);                                     \
+	if (fd < 0) {                                                      \
+		fprintf(stderr, "Couldn't open the ECN counter files\n");      \
+		return 1;                                                      \
+	}                                                                  \
+	ECN_COUNTER(ecn_fds, counter) = fd;                                \
 }
 
-#define ECN_OPEN(ecn_fds, dev_name, port_num)                       \
-{                                                                   \
-	ECN_OPEN_ONE(ecn_fds, dev_name, port_num, rp_cnp_handled);      \
-	ECN_OPEN_ONE(ecn_fds, dev_name, port_num, rp_cnp_ignored);      \
-	ECN_OPEN_ONE(ecn_fds, dev_name, port_num, np_cnp_sent);         \
-	ECN_OPEN_ONE(ecn_fds, dev_name, port_num,                       \
-		np_ecn_marked_roce_packets);                                \
+#define ECN_OPEN(ecn_fds, dev_name, port_num)                          \
+{                                                                      \
+	ECN_OPEN_ONE(ecn_fds, dev_name, port_num, rp_cnp_handled);         \
+	ECN_OPEN_ONE(ecn_fds, dev_name, port_num, rp_cnp_ignored);         \
+	ECN_OPEN_ONE(ecn_fds, dev_name, port_num, np_cnp_sent);            \
+	ECN_OPEN_ONE(ecn_fds, dev_name, port_num,                          \
+		np_ecn_marked_roce_packets);                                   \
 }
 
-#define ECN_CLOSE_ONE(ecn_fds, counter)                             \
+#define ECN_CLOSE_ONE(ecn_fds, counter)                                \
 	close(ECN_COUNTER(ecn_fds, counter))
 
-#define ECN_CLOSE(ecn_fds)                                          \
-{                                                                   \
-	ECN_CLOSE_ONE(ecn_fds, rp_cnp_handled);                         \
-	ECN_CLOSE_ONE(ecn_fds, rp_cnp_ignored);                         \
-	ECN_CLOSE_ONE(ecn_fds, np_cnp_sent);                            \
-	ECN_CLOSE_ONE(ecn_fds, np_ecn_marked_roce_packets);             \
+#define ECN_CLOSE(ecn_fds)                                             \
+{                                                                      \
+	ECN_CLOSE_ONE(ecn_fds, rp_cnp_handled);                            \
+	ECN_CLOSE_ONE(ecn_fds, rp_cnp_ignored);                            \
+	ECN_CLOSE_ONE(ecn_fds, np_cnp_sent);                               \
+	ECN_CLOSE_ONE(ecn_fds, np_ecn_marked_roce_packets);                \
 }
 
-#define ECN_READ_ONE(ecn_fds, out, counter)                         \
-{                                                                   \
-	char read_buf[MAX_ECN_VALUE_LEN];                               \
-	lseek(ECN_COUNTER(ecn_fds, counter), 0, SEEK_SET);              \
-	int ret = read(ECN_COUNTER(ecn_fds, counter),                   \
-		&read_buf, MAX_ECN_VALUE_LEN);                              \
-	if (ret < 0) {                                                  \
-		return ret;                                                 \
-	}                                                               \
-	read_buf[ret] = 0;                                              \
-	ECN_COUNTER(out, counter) = atoi(read_buf);                     \
+#define ECN_READ_ONE(ecn_fds, out, counter)                            \
+{                                                                      \
+	char read_buf[MAX_ECN_VALUE_LEN];                                  \
+	lseek(ECN_COUNTER(ecn_fds, counter), 0, SEEK_SET);                 \
+	int ret = read(ECN_COUNTER(ecn_fds, counter),                      \
+		&read_buf, MAX_ECN_VALUE_LEN);                                 \
+	if (ret < 0) {                                                     \
+		return ret;                                                    \
+	}                                                                  \
+	read_buf[ret] = 0;                                                 \
+	ECN_COUNTER(out, counter) = atoi(read_buf);                        \
 }
 
-#define ECN_READ(ecn_fds, out)                                      \
-{                                                                   \
-	ECN_READ_ONE(ecn_fds, out, rp_cnp_handled);                     \
-	ECN_READ_ONE(ecn_fds, out, rp_cnp_ignored);                     \
-	ECN_READ_ONE(ecn_fds, out, np_cnp_sent);                        \
-	ECN_READ_ONE(ecn_fds, out, np_ecn_marked_roce_packets);         \
+#define ECN_READ(ecn_fds, out)                                         \
+{                                                                      \
+	ECN_READ_ONE(ecn_fds, out, rp_cnp_handled);                        \
+	ECN_READ_ONE(ecn_fds, out, rp_cnp_ignored);                        \
+	ECN_READ_ONE(ecn_fds, out, np_cnp_sent);                           \
+	ECN_READ_ONE(ecn_fds, out, np_ecn_marked_roce_packets);            \
 }
 
-#define ECN_PRINT_ONE(out, counter)                                 \
+#define ECN_SUBTRACT_ONE(ecn_a, ecn_b, ecn_c, counter)                 \
+{                                                                      \
+	ECN_COUNTER(ecn_a, counter) = ECN_COUNTER(ecn_b, counter) -        \
+		ECN_COUNTER(ecn_c, counter);                                   \
+}
+
+#define ECN_SUBTRACT(ecn_a, ecn_b, ecn_c)                              \
+{                                                                      \
+	ECN_SUBTRACT_ONE(ecn_a, ecn_b, ecn_c, rp_cnp_handled);             \
+	ECN_SUBTRACT_ONE(ecn_a, ecn_b, ecn_c, rp_cnp_ignored);             \
+	ECN_SUBTRACT_ONE(ecn_a, ecn_b, ecn_c, np_cnp_sent);                \
+	ECN_SUBTRACT_ONE(ecn_a, ecn_b, ecn_c, np_ecn_marked_roce_packets); \
+}
+
+// TODO: "calibrate" the difference - to know when ECN read "improves"
+#define ECN_DIFF(ecn_a, ecn_b)                                         \
+	((ECN_COUNTER(ecn_a, np_cnp_sent) +                                \
+		ECN_COUNTER(ecn_a, np_ecn_marked_roce_packets)) >              \
+	 (ECN_COUNTER(ecn_b, np_cnp_sent) +                                \
+		ECN_COUNTER(ecn_b, np_ecn_marked_roce_packets)))
+
+#define ECN_PRINT_ONE(out, counter)                                    \
 	printf(#counter "=%i\n", (ECN_COUNTER(out, counter)))
 
-#define ECN_PRINT(ecn_fds)                                          \
-{                                                                   \
-	struct pingpong_ecn temp;          	                            \
-	ECN_READ(ecn_fds, &temp);                                       \
-	ECN_PRINT_ONE(&temp, rp_cnp_handled);                           \
-	ECN_PRINT_ONE(&temp, rp_cnp_ignored);                           \
-	ECN_PRINT_ONE(&temp, np_cnp_sent);                              \
-	ECN_PRINT_ONE(&temp, np_ecn_marked_roce_packets);               \
+#define ECN_PRINT(ecn_fds)                                             \
+{                                                                      \
+	struct pingpong_ecn temp;          	                               \
+	ECN_READ(ecn_fds, &temp);                                          \
+	ECN_PRINT_ONE(&temp, rp_cnp_handled);                              \
+	ECN_PRINT_ONE(&temp, rp_cnp_ignored);                              \
+	ECN_PRINT_ONE(&temp, np_cnp_sent);                                 \
+	ECN_PRINT_ONE(&temp, np_ecn_marked_roce_packets);                  \
 }
 
 struct pingpong_dest {
@@ -582,6 +608,68 @@ static void usage(const char *argv0)
 	printf("  -c, --conns=<conns>    number of concurrent connections (default 1)\n");
 	printf("  -b, --bandwidth        measure the bandwidth instead of the latency\n");
 	printf("  -q, --query-ecn        query ECN counter for each connection\n");
+	printf("  -o, --random-seed      set the random seed for the path ratio rebalancer\n");
+}
+
+static inline uint64_t pp_x86_timestamp()
+{
+    uint32_t low, high;
+    asm volatile ("rdtsc" : "=a" (low), "=d" (high));
+    return ((uint64_t)high << 32) | (uint64_t)low;
+}
+
+static uint64_t last_timestamp = 0;
+struct pingpong_ecn last_ecn_value;
+struct pingpong_ecn last_ecn_change;
+static unsigned last_incremented_index;
+static int last_incremented_value;
+
+static inline int pp_multipath_rebalance(struct pingpong_context *ctx, int num_connections)
+{
+	uint64_t now = pp_x86_timestamp();
+	if (now - last_timestamp < MP_REBALANCE_INTERVAL) {
+		last_timestamp = now;
+		return 0;
+	}
+
+	struct pingpong_ecn ecn_value, ecn_change;
+	ECN_READ(&ctx->ecn_fds, &ecn_value);
+	ECN_SUBTRACT(&ecn_change, &ecn_value, &last_ecn_value);
+	last_timestamp = now;
+
+	/* Use ECN to decide how to send packets */
+	int has_improved = ECN_DIFF(&last_ecn_change, &ecn_change);
+	int tried_incrementing = (last_incremented_index != -1);
+	if (tried_incrementing) {
+		if (has_improved) {
+			last_incremented_value *= 2; /* Note: can be negative! */
+		} else {
+			last_incremented_value = -1;
+		}
+	} else {
+		last_incremented_index = rand_r(&ctx->random_seed);
+		last_incremented_value = 1;
+	}
+
+	/* Increment by using the selected path index and value */
+	ctx->ratio[last_incremented_index] += last_incremented_value;
+	if (ctx->ratio[last_incremented_index] > MAX_RATIO) {
+		/* Normalize the values - divide all by two */
+		int i;
+		for (i = 0; i < num_connections; i++) {
+			ctx->ratio[i] >>= 1;
+		}
+	}
+
+	/* If we reached the peak - try a new path to balance */
+	if (last_incremented_value < 0) {
+		last_incremented_index = -1;
+	}
+
+	/* store values for the next time we rebalance */
+	memcpy(&last_ecn_change, &ecn_change, sizeof(ecn_change));
+	memcpy(&last_ecn_value, &ecn_value, sizeof(ecn_change));
+	return 0;
 }
 
 int main(int argc, char *argv[])
@@ -614,6 +702,7 @@ int main(int argc, char *argv[])
 	int                      wr_id_type;
 	int                      use_bandwidth;
 	int                      query_ecn;
+	int                      random_seed;
 
 	srand48(getpid() * time(NULL));
 
@@ -621,19 +710,20 @@ int main(int argc, char *argv[])
 		int c;
 
 		static struct option long_options[] = {
-			{ .name = "port",     .has_arg = 1, .val = 'p' },
-			{ .name = "ib-dev",   .has_arg = 1, .val = 'd' },
-			{ .name = "ib-port",  .has_arg = 1, .val = 'i' },
-			{ .name = "size",     .has_arg = 1, .val = 's' },
-			{ .name = "mtu",      .has_arg = 1, .val = 'm' },
-			{ .name = "rx-depth", .has_arg = 1, .val = 'r' },
-			{ .name = "iters",    .has_arg = 1, .val = 'n' },
-			{ .name = "sl",       .has_arg = 1, .val = 'l' },
-			{ .name = "events",   .has_arg = 0, .val = 'e' },
-			{ .name = "gid-idx",  .has_arg = 1, .val = 'g' },
-			{ .name = "conns",    .has_arg = 1, .val = 'c' },
-			{ .name = "bandwidth",.has_arg = 0, .val = 'b' },
-			{ .name = "query-ecn",.has_arg = 0, .val = 'q' },
+			{ .name = "port",       .has_arg = 1, .val = 'p' },
+			{ .name = "ib-dev",     .has_arg = 1, .val = 'd' },
+			{ .name = "ib-port",    .has_arg = 1, .val = 'i' },
+			{ .name = "size",       .has_arg = 1, .val = 's' },
+			{ .name = "mtu",        .has_arg = 1, .val = 'm' },
+			{ .name = "rx-depth",   .has_arg = 1, .val = 'r' },
+			{ .name = "iters",      .has_arg = 1, .val = 'n' },
+			{ .name = "sl",         .has_arg = 1, .val = 'l' },
+			{ .name = "events",     .has_arg = 0, .val = 'e' },
+			{ .name = "gid-idx",    .has_arg = 1, .val = 'g' },
+			{ .name = "conns",      .has_arg = 1, .val = 'c' },
+			{ .name = "bandwidth",  .has_arg = 0, .val = 'b' },
+			{ .name = "query-ecn",  .has_arg = 0, .val = 'q' },
+			{ .name = "random-seed",.has_arg = 1, .val = 'o' },
 			{ 0 }
 		};
 
@@ -706,6 +796,10 @@ int main(int argc, char *argv[])
 			++query_ecn;
 			break;
 
+		case 'o':
+			random_seed = strtol(optarg, NULL, 0);
+			break;
+
 		default:
 			usage(argv[0]);
 			return 1;
@@ -751,6 +845,7 @@ int main(int argc, char *argv[])
 
 	if (query_ecn) {
 		ECN_OPEN(&ctx->ecn_fds, ib_dev->dev_name, port);
+		ctx->random_seed = random_seed;
 	}
 
 	for (qp_idx = 0; qp_idx < conns; qp_idx++) {
@@ -900,6 +995,11 @@ int main(int argc, char *argv[])
 					}
 
 					++scnt;
+					if (scnt % MP_REBALANCE_SEND_FRACTION == 0) {
+						if (pp_multipath_rebalance(ctx, conns)) {
+							return 1;
+						}
+					}
 					break;
 
 				case PINGPONG_RECV_WRID:
